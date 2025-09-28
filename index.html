@@ -124,8 +124,8 @@
         <button id="logoutBtn" class="btn btn-ghost">Log out</button>
       </div>
 
-      <!-- Trader metrics -->
-      <div id="traderMetrics" class="metrics" style="margin:16px 0" hidden>
+      <!-- Trader metrics (NEVER shown to admins) -->
+      <div id="traderMetrics" class="metrics hidden" style="margin:16px 0">
         <div class="metric">
           <div class="label">Working Capital</div>
           <div class="value">₹<span id="workingCap">0.00</span></div>
@@ -151,7 +151,7 @@
 
       <!-- Details + Admin column -->
       <section class="details" style="margin-top:16px">
-        <!-- LEFT: For traders = chart+trade; for admins = portfolio viewer -->
+        <!-- LEFT: Trader = chart+trade; Admin = portfolio viewer -->
         <div class="panel" style="padding:16px">
           <div class="row">
             <h3 id="detailName" style="margin:0">Select a stock</h3>
@@ -179,7 +179,7 @@
             <span id="autoMsg" class="muted"></span>
           </div>
 
-          <!-- Admin-only portfolio view moved here -->
+          <!-- Admin-only portfolio view placed here -->
           <div id="adminPortfolioView" class="hidden">
             <h3 style="margin:14px 0 8px 0">View Trader Portfolio</h3>
             <div class="row" style="margin-bottom:8px">
@@ -336,6 +336,7 @@
     let series = [];
     let chartCtx = $("chart").getContext("2d");
     let lastSampleTime = 0;
+    let pfUnsub = null; // realtime subscription for admin portfolio view
 
     const SEED_STOCKS = [
       "Reliance Industries","TCS","Infosys","HDFC Bank","ICICI Bank",
@@ -381,6 +382,14 @@
       if(!myRole){ showLogin("Role not found. Create /roles/<UID> with {email, role}."); return; }
 
       roleHeader.textContent = `Welcome, ${myRole}`;
+
+      // ✅ Trader metrics are 100% hidden for admins
+      if (myRole === "admin"){
+        traderMetrics.classList.add("hidden");
+      } else {
+        traderMetrics.classList.remove("hidden");
+      }
+
       adminControls.classList.toggle("hidden", myRole!=="admin");
       adminOnlyHint.classList.toggle("hidden", myRole==="admin");
 
@@ -395,12 +404,12 @@
       dashboard.classList.remove("hidden");
 
       await bootstrapStocks();
-      attachRealtime();
+      attachRealtime();              // realtime stocks for ALL users
       startAnimationLoop();
-      attachTraderDoc();
+      attachTraderDoc();             // realtime SELF trader doc
       if (isAdmin) { loadRankingsLoop(); fillTraderDropdown(); }
 
-      // global jump timer
+      // global jump timer (purely local animation)
       setInterval(()=> { Object.values(stocks).forEach(s => jumpOnce(s)); }, TICK_MS);
     });
 
@@ -454,7 +463,13 @@
           const id = d.id;
           const prev = stocks[id] || {};
           const base = Number(data.baseline);
-          const priceInit = Number.isFinite(prev.price) ? prev.price : (Number.isFinite(base) ? base : prev.defaultBaseline);
+
+          // If baseline changed, force visible price to jump to new baseline (so ALL clients sync immediately)
+          const baselineChanged = Number.isFinite(prev.baseline) && Number.isFinite(base) && base !== prev.baseline;
+          const priceInit = baselineChanged
+              ? base
+              : (Number.isFinite(prev.price) ? prev.price : (Number.isFinite(base) ? base : prev.defaultBaseline));
+
           stocks[id] = {
             id,
             name: data.name || prev.name || id,
@@ -488,12 +503,12 @@
       series = [];
       tradeMsg.textContent = "";
       // show in admin which stock is selected
-      adminSelected.textContent = s.name;
+      adminSelected.textContent = s.name || "None";
       adminSelectedPrice.textContent = `• ₹ ${fmt(currentPriceFor(s))}`;
       raiseBtn.disabled = lowerBtn.disabled = (myRole!=="admin");
     }
 
-    // Admin ±10%
+    // Admin ±10% (writes baseline; all clients snap to it in onSnapshot)
     raiseBtn?.addEventListener("click", ()=> adjustSelected( 0.10));
     lowerBtn?.addEventListener("click", ()=> adjustSelected(-0.10));
     async function adjustSelected(delta){
@@ -502,8 +517,9 @@
       const ref = doc(db,"artifacts",APP_ID,"public","data","stocks", selectedId);
       const base = Number.isFinite(s.baseline) ? s.baseline : (s.defaultBaseline||500);
       const newBase = +(base * (1+delta)).toFixed(2);
+      // Optimistic local UI
       s.baseline = newBase;
-      s.price = newBase; // snap visible price
+      s.price = newBase;
       stocks[selectedId] = s;
       adminSelectedPrice.textContent = `• ₹ ${fmt(newBase)}`;
       try{
@@ -542,7 +558,7 @@
       onSnapshot(ref, snap=>{
         myTrader = snap.exists()? snap.data() : { cash:0, initialCash:0, portfolio:{}, autos:{} };
         if (myRole === "trader") {
-          traderMetrics.hidden = false;
+          traderMetrics.classList.remove("hidden");
           updateTraderMetrics();
         }
       });
@@ -599,7 +615,7 @@
       }
     }
 
-    /***** Trader metrics helpers *****/
+    /***** Trader helpers & actions *****/
     async function portfolioAndStats(uid){
       const s = await getDoc(traderRef(uid));
       const data = s.exists()? s.data(): { cash:0, initialCash:0, portfolio:{} };
@@ -615,12 +631,8 @@
       return { working, invested, pl, plPct, data };
     }
 
-    /***** Trader actions *****/
-    const buy = ()=> trade("buy");
-    const sell = ()=> trade("sell");
-    buyBtn.addEventListener("click", buy);
-    sellBtn.addEventListener("click", sell);
-
+    buyBtn.addEventListener("click", ()=> trade("buy"));
+    sellBtn.addEventListener("click",()=> trade("sell"));
     async function trade(kind){
       tradeMsg.textContent = "";
       if (!me){ tradeMsg.textContent="Please log in."; return; }
@@ -650,15 +662,18 @@
       if (myRole==="trader") updateTraderMetrics();
     }
 
-    /***** Admin: Funds, Reset, Rankings, Trader dropdown *****/
+    /***** Admin: Funds, Reset, Rankings, Trader dropdown (REALTIME portfolio) *****/
     applyFundsBtn.addEventListener("click", async ()=>{
       if(myRole!=="admin")return;
       const amt=parseFloat(allFunds.value);
       if(!Number.isFinite(amt)||amt<=0){fundsMsg.textContent="Enter a valid amount.";return;}
-      const tradersCol=collection(db,"artifacts",APP_ID,"public","data","traders");
-      const snap=await getDocs(tradersCol);
-      for(const d of snap.docs){
-        await setDoc(d.ref,{cash:amt,initialCash:amt,portfolio:{},autos:{}},{merge:true});
+      // iterate roles so even traders who never logged in yet get a doc
+      const rolesCol=collection(db,"artifacts",APP_ID,"public","data","roles");
+      const rSnap=await getDocs(rolesCol);
+      for(const d of rSnap.docs){
+        if(d.data().role==="trader"){
+          await setDoc(traderRef(d.id),{cash:amt,initialCash:amt,portfolio:{},autos:{}},{merge:true});
+        }
       }
       fundsMsg.textContent="Updated for all traders.";
     });
@@ -668,11 +683,13 @@
       if(myRole!=="admin")return;
       if(!confirm("This will reset ALL traders and ALL stocks. Continue?")) return;
 
-      // Reset traders
-      const tradersCol=collection(db,"artifacts",APP_ID,"public","data","traders");
-      const tSnap=await getDocs(tradersCol);
-      for(const d of tSnap.docs){
-        await setDoc(d.ref,{cash:100000,initialCash:100000,portfolio:{},autos:{}},{merge:true});
+      // Reset traders (use roles to include everyone)
+      const rolesCol=collection(db,"artifacts",APP_ID,"public","data","roles");
+      const rSnap=await getDocs(rolesCol);
+      for(const d of rSnap.docs){
+        if(d.data().role==="trader"){
+          await setDoc(traderRef(d.id),{cash:100000,initialCash:100000,portfolio:{},autos:{}},{merge:true});
+        }
       }
 
       // Reset stocks to fresh random baselines
@@ -721,27 +738,43 @@
       });
       if (traderSelect.options.length) {
         traderSelect.selectedIndex = 0;
-        renderSelectedTraderPortfolio();
+        subscribeTraderPortfolio(traderSelect.value); // realtime
       }
     }
 
-    traderSelect?.addEventListener("change", renderSelectedTraderPortfolio);
+    traderSelect?.addEventListener("change", ()=>{
+      subscribeTraderPortfolio(traderSelect.value);
+    });
 
-    async function renderSelectedTraderPortfolio(){
-      const uid = traderSelect.value;
-      if(!uid){ portfolioWrap.style.display="none"; return; }
-      const stats = await portfolioAndStats(uid);
-      pfTitle.textContent = `Portfolio – ${traderSelect.selectedOptions[0].textContent}`;
-      pfSummary.textContent = `Working: ₹${fmt(stats.working)}  •  Invested: ₹${fmt(stats.invested)}  •  P/L: ${stats.pl>=0?'+':''}${fmt(stats.pl)} (${fmt(stats.plPct)}%)`;
-      pfTable.innerHTML = "";
-      Object.entries(stats.data.portfolio||{}).forEach(([sid,pos])=>{
-        const p = currentPriceFor(stocks[sid]);
-        const val = p * (pos.quantity||0);
-        const tr = document.createElement("tr"); tr.className="data";
-        tr.innerHTML = `<td>${stocks[sid]?.name||sid}</td><td>${pos.quantity||0}</td><td>₹ ${fmt(p)}</td><td>₹ ${fmt(val)}</td>`;
-        pfTable.appendChild(tr);
+    function subscribeTraderPortfolio(uid){
+      if (pfUnsub) { pfUnsub(); pfUnsub = null; }
+      if (!uid){ portfolioWrap.style.display="none"; return; }
+      pfUnsub = onSnapshot(traderRef(uid), async (snap)=>{
+        if (!snap.exists()){ portfolioWrap.style.display="none"; return; }
+        const data = snap.data();
+        // recompute with live prices
+        const working = +data.cash || 0;
+        let invested = 0;
+        Object.entries(data.portfolio||{}).forEach(([sid,pos])=>{
+          const st = stocks[sid]; if (!st) return;
+          invested += (pos.quantity||0)*currentPriceFor(st);
+        });
+        const initial = +data.initialCash || 0;
+        const pl = (working+invested)-initial;
+        const plPct = initial? (pl/initial*100) : 0;
+
+        pfTitle.textContent = `Portfolio – ${traderSelect.selectedOptions[0].textContent}`;
+        pfSummary.textContent = `Working: ₹${fmt(working)}  •  Invested: ₹${fmt(invested)}  •  P/L: ${pl>=0?'+':''}${fmt(pl)} (${fmt(plPct)}%)`;
+        pfTable.innerHTML = "";
+        Object.entries(data.portfolio||{}).forEach(([sid,pos])=>{
+          const p = currentPriceFor(stocks[sid]);
+          const val = p * (pos.quantity||0);
+          const tr = document.createElement("tr"); tr.className="data";
+          tr.innerHTML = `<td>${stocks[sid]?.name||sid}</td><td>${pos.quantity||0}</td><td>₹ ${fmt(p)}</td><td>₹ ${fmt(val)}</td>`;
+          pfTable.appendChild(tr);
+        });
+        portfolioWrap.style.display = "block";
       });
-      portfolioWrap.style.display = "block";
     }
 
     /***** Animation: tiles/price text, chart, autos, metrics *****/
@@ -779,7 +812,7 @@
           if (selectedId && stocks[selectedId]){
             const p = currentPriceFor(stocks[selectedId]);
             detailPrice.textContent = `₹ ${fmt(p)}`;
-            adminSelectedPrice.textContent = myRole==="admin" ? `• ₹ ${fmt(p)}` : adminSelectedPrice.textContent;
+            adminSelectedPrice.textContent = (myRole==="admin") ? `• ₹ ${fmt(p)}` : adminSelectedPrice.textContent;
             if (!chartEl.classList.contains("hidden")) {
               if (now - lastSampleTime > 200){
                 lastSampleTime = now;
@@ -799,4 +832,3 @@
   </script>
 </body>
 </html>
-
